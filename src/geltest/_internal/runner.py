@@ -428,7 +428,6 @@ class ParallelTestSuite(unittest.TestSuite):
         self.server_ver = server_ver
         self.backend_dsn = backend_dsn
         self.num_workers = num_workers
-        self.stop_requested = False
         self.worker_init = worker_init
 
     def run(self, result: ParallelTextTestResult) -> ParallelTextTestResult:  # type: ignore [override]
@@ -488,7 +487,7 @@ class ParallelTestSuite(unittest.TestSuite):
 
         with pool:
             for is_repeat in (False, True):
-                if self.stop_requested:
+                if result.shouldStop:
                     break
 
                 items = [
@@ -522,7 +521,7 @@ class ParallelTestSuite(unittest.TestSuite):
                                 sys.stderr.flush()
                                 os._exit(1)
 
-                        if self.stop_requested:
+                        if result.shouldStop:
                             break
                         else:
                             continue
@@ -555,7 +554,6 @@ class SequentialTestSuite(unittest.TestSuite):
         worker_init: Callable[[], None] | None,
     ) -> None:
         self.tests = _unroll_suites(tests)
-        self.stop_requested = False
         self.worker_init = worker_init
 
     def run(self, result_: ParallelTextTestResult) -> ParallelTextTestResult:  # type: ignore [override]
@@ -569,7 +567,7 @@ class SequentialTestSuite(unittest.TestSuite):
 
         for test in self.tests:
             _run_test(test)
-            if self.stop_requested:
+            if result.shouldStop:
                 break
 
         # Make sure the class and the module teardown methods are
@@ -654,6 +652,9 @@ class BaseRenderer:
     def report_still_running(self, still_running: dict[str, float]) -> None:
         return
 
+    def report_stop_request(self) -> None:
+        pass
+
 
 class SimpleRenderer(BaseRenderer):
     def report(
@@ -669,6 +670,9 @@ class SimpleRenderer(BaseRenderer):
             nl=False,
             file=self.stream,
         )
+
+    def report_stop_request(self) -> None:
+        click.echo("Stop requested, waiting for current tests to complete\n")
 
 
 class SilentRenderer(BaseRenderer):
@@ -722,6 +726,9 @@ class VerboseRenderer(BaseRenderer):
         newline_join = "\n   "
         click.echo(f"still running:\n  {newline_join.join(items)}")
 
+    def report_stop_request(self) -> None:
+        click.echo("Stop requested, waiting for current tests to complete\n")
+
 
 class MultiLineRenderer(BaseRenderer):
     FT_LABEL = "First few failed: "
@@ -740,6 +747,7 @@ class MultiLineRenderer(BaseRenderer):
 
         self.total_tests = len(tests)
         self.completed_tests = 0
+        self.stop_requested = False
 
         test_modules = {test.__class__.__module__ for test in tests}
         max_test_module_len = max(
@@ -788,6 +796,9 @@ class MultiLineRenderer(BaseRenderer):
     def report_still_running(self, still_running: dict[str, float]) -> None:
         # Still-running tests are already reported in normal repert
         return
+
+    def report_stop_request(self) -> None:
+        self.stop_requested = True
 
     def _render_modname(self, name: str) -> str:
         return name.replace(".", "/") + ".py"
@@ -933,6 +944,10 @@ class MultiLineRenderer(BaseRenderer):
             f"Progress: {self.completed_tests}/{self.total_tests} tests."
         )
 
+        if self.stop_requested:
+            print_empty_line()
+            print_line("Stop requested, waiting for current tests to complete")
+
         if self.max_lines > len(lines):
             for _ in range(self.max_lines - len(lines)):
                 lines.insert(0, " " * cols)
@@ -1019,6 +1034,10 @@ class ParallelTextTestResult(unittest.result.TestResult):
         else:
             self.ren = SimpleRenderer(tests=tests, stream=stream)
 
+    def stop(self) -> None:
+        super().stop()
+        self.ren.report_stop_request()
+
     def report_progress(
         self,
         test: unittest.TestCase,
@@ -1094,7 +1113,7 @@ class ParallelTextTestResult(unittest.result.TestResult):
         super().addError(test, err)
         self.report_progress(test, Markers.errored)
         if self.failfast:
-            self.suite.stop_requested = True
+            self.shouldStop = True
 
     def addFailure(
         self, test: unittest.TestCase, err: results.OptExcInfo
@@ -1102,7 +1121,7 @@ class ParallelTextTestResult(unittest.result.TestResult):
         super().addFailure(test, err)
         self.report_progress(test, Markers.failed)
         if self.failfast:
-            self.suite.stop_requested = True
+            self.shouldStop = True
 
     def addSubTest(
         self,
@@ -1120,7 +1139,7 @@ class ParallelTextTestResult(unittest.result.TestResult):
                 currently_running=list(self.currently_running),
             )
             if self.failfast:
-                self.suite.stop_requested = True
+                self.shouldStop = True
 
     def addSkip(self, test: unittest.TestCase, reason: str) -> None:
         super().addSkip(test, reason)
@@ -1295,6 +1314,8 @@ class ParallelTextTestRunner:
                 suite=suite,
             )
             unittest.signals.registerResult(result)
+            # Handle Ctrl+C nicely
+            unittest.signals.installHandler()
 
             self.ui.info("\nRunning tests\n\n")
             suite.run(result)
